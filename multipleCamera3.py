@@ -186,7 +186,6 @@ class CameraThread:
 def draw_roi(event, x, y, flags, param):
     global roi_start, roi_end, rois, selected_camera
 
-    # คำนวณว่าเมาส์อยู่ในตำแหน่งของกล้องใด
     cam_id = None
     for i, pos in enumerate(param):
         cam_x, cam_y = pos
@@ -204,11 +203,18 @@ def draw_roi(event, x, y, flags, param):
         roi_end = (x - pos[0], y - pos[1])
     elif event == cv2.EVENT_LBUTTONUP and roi_start:
         roi_end = (x - pos[0], y - pos[1])
-        if selected_camera not in rois:
-            rois[selected_camera] = []
-        rois[selected_camera].append((roi_start, roi_end))
+
+        # ตรวจสอบจำนวน ROI ในกล้องนั้น และจำกัดไว้ที่ 2
+        if cam_id not in rois:
+            rois[cam_id] = []
+        
+        if len(rois[cam_id]) < 2:
+            rois[cam_id].append((roi_start, roi_end))
+            print(f"ROI added for Camera {cam_id}: {rois[cam_id][-1]}")
+        else:
+            print(f"Camera {cam_id} reached the maximum ROI limit of 2")
+
         roi_start, roi_end = None, None
-        print(f"ROI added for Camera {selected_camera}: {rois[selected_camera][-1]}")
 
 def main():
     available_cameras = scan_cameras()
