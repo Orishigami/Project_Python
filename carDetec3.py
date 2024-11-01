@@ -8,6 +8,7 @@ roi_start = None
 roi_end = None
 rois = {}
 selected_camera = None
+car_count_per_roi = {}  # ตัวแปรเก็บจำนวนรถสำหรับแต่ละ ROI ของกล้องแต่ละตัว
 
 # กำหนดสีสำหรับ ROI ในแต่ละกล้อง
 roi_colors = [(0, 0, 255), (0, 255, 0)]  # สีแดงและสีเขียว
@@ -23,6 +24,11 @@ with open(yolo_names, "r") as f:
 
 # กำหนดค่าของ YOLO
 net = cv2.dnn.readNet(yolo_weights, yolo_config)
+
+# ใช้ CUDA กับ YOLOv3
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+
 layer_names = net.getLayerNames()
 output_layers = net.getUnconnectedOutLayersNames()
 
@@ -198,27 +204,32 @@ def draw_roi(event, x, y, flags, param):
         roi_start, roi_end = None, None
 
 def is_point_in_roi(x, y, roi_start, roi_end):
-    """
-    ตรวจสอบว่าจุดอยู่ภายใน ROI หรือไม่
-    """
     x1, y1 = min(roi_start[0], roi_end[0]), min(roi_start[1], roi_end[1])
     x2, y2 = max(roi_start[0], roi_end[0]), max(roi_start[1], roi_end[1])
     return x1 <= x <= x2 and y1 <= y <= y2
 
 def is_box_in_roi(box, roi_start, roi_end):
-    """
-    ตรวจสอบว่ากล่องที่ตรวจจับได้อยู่ใน ROI หรือไม่
-    box format: [x, y, w, h]
-    """
-    # จุดกึ่งกลางของกล่อง
     center_x = box[0] + box[2] // 2
     center_y = box[1] + box[3] // 2
     return is_point_in_roi(center_x, center_y, roi_start, roi_end)
 
-def detect_objects(frame, camera_rois=None, detection_active=False):
-    # ถ้าการตรวจจับไม่ได้เปิดใช้งาน หรือไม่มี ROI ให้ return ค่าว่าง
+def detect_objects(frame, camera_rois=None, detection_active=False, cam_id=None):
+
     if not detection_active or not camera_rois:
         return []
+
+    # เลือก GPU สำหรับการประมวลผล
+    gpu_id = gpu_manager.get_next_gpu()
+    if gpu_id is not None:
+        cv2.cuda.setDevice(gpu_id)
+        net = gpu_manager.models[gpu_id]
+    else:
+        net = gpu_manager.models['cpu']
+
+    height, width = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+    net.setInput(blob)
+    outs = net.forward(output_layers)
 
     height, width = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
@@ -229,6 +240,9 @@ def detect_objects(frame, camera_rois=None, detection_active=False):
     confidences = []
     class_ids = []
     
+    # รีเซ็ตตัวนับจำนวนรถของกล้องแต่ละตัวสำหรับแต่ละ ROI ก่อนการตรวจจับ
+    car_count_per_roi[cam_id] = [0] * len(camera_rois)
+
     for out in outs:
         for detection in out:
             scores = detection[5:]
@@ -244,12 +258,13 @@ def detect_objects(frame, camera_rois=None, detection_active=False):
                 y = int(center_y - h / 2)
                 
                 box = [x, y, w, h]
-                # ตรวจสอบว่ากล่องอยู่ในพื้นที่ ROI หรือไม่
-                for roi_start, roi_end in camera_rois:
+                
+                for idx, (roi_start, roi_end) in enumerate(camera_rois):
                     if is_box_in_roi(box, roi_start, roi_end):
                         boxes.append(box)
                         confidences.append(float(confidence))
                         class_ids.append(class_id)
+                        car_count_per_roi[cam_id][idx] += 1  # เพิ่มจำนวนรถใน ROI นี้
                         break
 
     indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
@@ -263,13 +278,204 @@ def detect_objects(frame, camera_rois=None, detection_active=False):
     
     return result_boxes
 
-def draw_detected_objects(frame, boxes):
+def print_gpu_stats():
+    """
+    แสดงสถิติการใช้งาน GPU
+    """
+    for gpu in gpu_manager.gpus:
+        cv2.cuda.setDevice(gpu['device_id'])
+        free_mem, total_mem = cv2.cuda.getMemInfo()
+        used_mem = total_mem - free_mem
+        usage_percent = (used_mem / total_mem) * 100
+        
+        print(f"\nGPU {gpu['device_id']}: {gpu['name']}")
+        print(f"Memory Usage: {used_mem/1024**3:.2f}GB / {total_mem/1024**3:.2f}GB ({usage_percent:.1f}%)")
+
+def draw_detected_objects(frame, boxes, cam_id):
     for (x, y, w, h, label, confidence) in boxes:
         color = (255, 0, 0)
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
         cv2.putText(frame, f"{label} {confidence:.2f}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+    # แสดงจำนวนรถในแต่ละ ROI บนหน้าจอ
+    if cam_id in car_count_per_roi:
+        for idx, count in enumerate(car_count_per_roi[cam_id]):
+            start, end = rois[cam_id][idx]
+            color = roi_colors[idx % len(roi_colors)]
+            cv2.putText(
+                frame,
+                f"Cars: {count}",
+                (start[0], start[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+def check_cuda_availability():
+    """
+    ตรวจสอบว่าระบบสามารถใช้งาน CUDA ได้หรือไม่
+    returns: (bool, str) - (CUDA available?, message)
+    """
+    try:
+        # ตรวจสอบว่า OpenCV build มี CUDA support หรือไม่
+        cv2_cuda = cv2.cuda.getCudaEnabledDeviceCount() > 0
+        
+        if not cv2_cuda:
+            return False, "OpenCV was not built with CUDA support"
+        
+        # ตรวจสอบว่ามี CUDA device พร้อมใช้งานหรือไม่
+        device_count = cv2.cuda.getCudaEnabledDeviceCount()
+        if device_count == 0:
+            return False, "No CUDA devices available"
+            
+        # ตรวจสอบข้อมูล CUDA device
+        device = cv2.cuda.getDevice()
+        device_name = cv2.cuda.getDeviceName(device)
+        compute_capability = cv2.cuda.computeCapability(device)
+        
+        return True, f"CUDA available on {device_name} (Compute {compute_capability[0]}.{compute_capability[1]})"
+        
+    except Exception as e:
+        return False, f"Error checking CUDA: {str(e)}"
+
+# แก้ไขส่วนการโหลด YOLO model
+def initialize_yolo(use_cuda=True):
+    """
+    โหลดและกำหนดค่า YOLO model
+    params:
+        use_cuda: bool - เปิดใช้งาน CUDA หรือไม่
+    returns: (net, message)
+    """
+    try:
+        net = cv2.dnn.readNet(yolo_weights, yolo_config)
+        
+        if use_cuda:
+            cuda_available, cuda_message = check_cuda_availability()
+            if cuda_available:
+                print(f"Enabling CUDA: {cuda_message}")
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+            else:
+                print(f"CUDA not available: {cuda_message}")
+                print("Falling back to CPU")
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        else:
+            print("Using CPU (CUDA disabled)")
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            
+        return net, "Model loaded successfully"
+        
+    except Exception as e:
+        return None, f"Error initializing YOLO: {str(e)}"    
+
+def get_available_gpus():
+    """
+    ตรวจสอบและคืนค่า GPU ที่สามารถใช้งานได้ทั้งหมด
+    returns: list of (device_id, name, memory)
+    """
+    available_gpus = []
+    try:
+        device_count = cv2.cuda.getCudaEnabledDeviceCount()
+        for device_id in range(device_count):
+            cv2.cuda.setDevice(device_id)
+            device_name = cv2.cuda.getDeviceName(device_id)
+            free_mem, total_mem = cv2.cuda.getMemInfo()
+            compute_capability = cv2.cuda.computeCapability(device_id)
+            
+            gpu_info = {
+                'device_id': device_id,
+                'name': device_name,
+                'free_memory': free_mem,
+                'total_memory': total_mem,
+                'compute_capability': compute_capability
+            }
+            available_gpus.append(gpu_info)
+            
+    except Exception as e:
+        print(f"Error getting GPU info: {str(e)}")
+    
+    return available_gpus
+
+class MultiGPUManager:
+    def __init__(self):
+        self.gpus = get_available_gpus()
+        self.models = {}
+        self.current_gpu_index = 0
+    
+    def initialize_models(self):
+        """
+        โหลด YOLO model สำหรับแต่ละ GPU ที่ใช้งานได้
+        """
+        if not self.gpus:
+            print("No GPUs available, falling back to CPU")
+            net = cv2.dnn.readNet(yolo_weights, yolo_config)
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            self.models['cpu'] = net
+            return
+        
+        for gpu in self.gpus:
+            try:
+                cv2.cuda.setDevice(gpu['device_id'])
+                net = cv2.dnn.readNet(yolo_weights, yolo_config)
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                self.models[gpu['device_id']] = net
+                print(f"Initialized model on GPU {gpu['device_id']}: {gpu['name']}")
+            except Exception as e:
+                print(f"Failed to initialize model on GPU {gpu['device_id']}: {str(e)}")
+    
+    def get_next_gpu(self):
+        """
+        เลือก GPU ถัดไปแบบ round-robin
+        """
+        if not self.gpus:
+            return None
+        
+        gpu = self.gpus[self.current_gpu_index]
+        self.current_gpu_index = (self.current_gpu_index + 1) % len(self.gpus)
+        return gpu['device_id']
+
 def main():
+
+    global gpu_manager
+    gpu_manager = MultiGPUManager()
+    
+    # แสดงข้อมูล GPU ที่พบ
+    print("\nDetected GPUs:")
+    for gpu in gpu_manager.gpus:
+        print(f"GPU {gpu['device_id']}: {gpu['name']}")
+        print(f"Memory: {gpu['free_memory']/1024**3:.2f}GB free / {gpu['total_memory']/1024**3:.2f}GB total")
+        print(f"Compute Capability: {gpu['compute_capability'][0]}.{gpu['compute_capability'][1]}")
+        print()
+    
+    # โหลด model สำหรับแต่ละ GPU
+    gpu_manager.initialize_models()
+    # ตรวจสอบ CUDA ก่อนเริ่มโปรแกรม
+    cuda_available, cuda_message = check_cuda_availability()
+    print(f"\nCUDA Status: {cuda_message}")
+
+    # โหลด YOLO model
+    global net
+    net, model_message = initialize_yolo(use_cuda=cuda_available)
+    if net is None:
+        print(f"Failed to initialize YOLO: {model_message}")
+        return
+    
+    print(f"YOLO Status: {model_message}")
+    
+    # แสดงข้อมูลการใช้งาน GPU/CPU
+    if cuda_available:
+        device = cv2.cuda.getDevice()
+        print(f"Using GPU: {cv2.cuda.getDeviceName(device)}")
+        free_mem, total_mem = cv2.cuda.getMemInfo()
+        print(f"GPU Memory: {free_mem/1024**3:.2f}GB free / {total_mem/1024**3:.2f}GB total")
+    else:
+        print("Using CPU for inference")
+
     available_cameras = scan_cameras()
     if not available_cameras:
         print("ไม่สามารถเริ่มโปรแกรมได้เนื่องจากไม่พบกล้อง")
@@ -303,15 +509,14 @@ def main():
                 resized_frame = cv2.resize(frame, (426, 240))
                 cam_x, cam_y = camera_positions[i]
 
-                # ตรวจจับวัตถุเฉพาะเมื่อ detection_active เป็น True
                 detected_boxes = detect_objects(
                     resized_frame,
                     rois.get(i, None),
-                    camera.detection_active
+                    camera.detection_active,
+                    cam_id=i  # ส่ง cam_id เพื่อนับจำนวนรถในแต่ละกล้อง
                 )
-                draw_detected_objects(resized_frame, detected_boxes)
+                draw_detected_objects(resized_frame, detected_boxes, cam_id=i)
 
-                # แสดงสถานะการตรวจจับ
                 status = "Detection: ON" if camera.detection_active else "Detection: OFF"
                 cv2.putText(
                     resized_frame,
